@@ -1,0 +1,23 @@
+# Bomb pick-and-place: pick up the bomb box among safe objects (wet tissues etc.)
+# and place it in the disposal box aside
+repo_id: kmg0620/so101_bomb_pick_place_v1
+task: "Pick up the sky blue battery and place it in the box"
+
+num_episodes: 100
+episode_time_s: 30
+fps: 30
+
+follower_port: /dev/ttyACM_FOLLOWER
+leader_port: /dev/ttyACM_LEADER
+wrist_cam_type: opencv
+wrist_cam: /dev/video4
+wrist_cam_fps: 30
+wrist_cam_width: 640
+wrist_cam_height: 480
+overhead_cam: /dev/video2
+cam_width: 640
+cam_height: 480
+
+home_joints_deg: [0.0, -160.0, 160.0, 10.0, 0.0]
+home_gripper: 5.0
+safe_joint_wait_s: 1.5

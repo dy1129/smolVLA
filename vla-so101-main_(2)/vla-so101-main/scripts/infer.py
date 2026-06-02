@@ -1,0 +1,392 @@
+"""
+Run a trained SmolVLA policy on the SO-101 follower arm.
+
+Loads the checkpoint, connects to the robot (with cameras), and runs
+a closed-loop control loop: observe → predict action → send to robot.
+
+Usage:
+    uv run python scripts/infer.py
+    uv run python scripts/infer.py --checkpoint outputs/train/smolvla_so101_pick_place/checkpoints/010000
+    uv run python scripts/infer.py --num-rollouts 5
+"""
+
+import argparse
+import logging
+import os
+import subprocess
+import threading
+import time
+from datetime import datetime
+
+import numpy as np
+import torch
+
+from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+from lerobot.datasets.feature_utils import build_dataset_frame, hw_to_dataset_features
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from lerobot.robots.so_follower.config_so_follower import SO101FollowerConfig
+from lerobot.robots.so_follower.so_follower import SO101Follower
+from lerobot.utils.control_utils import init_keyboard_listener, predict_action
+from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.device_utils import get_safe_torch_device
+from lerobot.utils.utils import init_logging, log_say
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+
+# Motor names for the 5 joints (excluding gripper)
+_IK_MOTOR_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+
+
+def _clamp_degrees(joints: np.ndarray) -> np.ndarray:
+    """Clamp joint angles to [-180, 180] range."""
+    return np.clip(joints, -180.0, 180.0)
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+DEFAULT_CHECKPOINT = "outputs/train/smolvla_so101_bomb/checkpoints/last/pretrained_model"
+TASK = "Pick up the sky blue battery and place it in the box"
+
+FOLLOWER_PORT = "/dev/ttyACM_FOLLOWER"
+WRIST_CAM = "/dev/video5"
+OVERHEAD_CAM = "/dev/video8"
+OVERHEAD_MIC = "alsa_input.usb-046d_HD_Pro_Webcam_C920-02.analog-stereo"  # PipeWire source for webcam mic
+
+FPS = 30
+EPISODE_TIME_S = 30
+
+# Home joint positions (degrees) — same as record.py
+HOME_JOINTS_DEG = np.array([0.0, -160.0, 160.0, 10.0, 0.0])
+HOME_GRIPPER = 5.0
+
+
+# ffmpeg filter: overhead as background, wrist PiP bottom-right with white border.
+# Input is two 640x480 RGB frames stacked vertically (640x960).
+FFMPEG_FILTER = (
+    "[0:v]split=2[oh][wr];"
+    "[oh]crop=640:480:0:0,scale=960:720,crop=960:540:0:90[bg];"
+    "[wr]crop=480:480:80:480,scale=240:240,pad=244:244:2:2:white[pip];"
+    "[bg][pip]overlay=960-244-12:540-244-12[v]"
+)
+
+
+class FrameRecorder:
+    """Background thread that captures camera frames at a fixed FPS and pipes to ffmpeg."""
+
+    def __init__(self, robot: SO101Follower, ffmpeg: subprocess.Popen, fps: int):
+        self._robot = robot
+        self._ffmpeg = ffmpeg
+        self._fps = fps
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def _capture_loop(self):
+        start = time.monotonic()
+        frames_written = 0
+        has_overhead = "overhead" in self._robot.cameras
+
+        while self._running:
+            try:
+                wrist = self._robot.cameras["wrist"].async_read()
+                if has_overhead:
+                    overhead = self._robot.cameras["overhead"].async_read()
+                    combined = np.concatenate([overhead, wrist], axis=0)
+                else:
+                    combined = wrist
+                raw = combined.tobytes()
+
+                # Write enough frames to match wall clock time
+                target = int((time.monotonic() - start) * self._fps) + 1
+                while frames_written < target:
+                    self._ffmpeg.stdin.write(raw)
+                    frames_written += 1
+
+                # Sleep until next frame is due
+                next_time = start + (frames_written + 1) / self._fps
+                sleep_for = next_time - time.monotonic()
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+            except Exception as e:
+                logging.warning(f"FrameRecorder error: {e}")
+                break
+
+        logging.info(f"FrameRecorder stopped: {frames_written} frames in {time.monotonic() - start:.1f}s")
+
+
+def make_follower(no_overhead: bool = False) -> SO101Follower:
+    cameras = {
+        "wrist": OpenCVCameraConfig(
+            index_or_path=WRIST_CAM,
+            fps=FPS,
+            width=640,
+            height=480,
+        ),
+    }
+    if not no_overhead:
+        cameras["overhead"] = OpenCVCameraConfig(
+            index_or_path=OVERHEAD_CAM,
+            width=640,
+            height=480,
+            fps=FPS,
+        )
+    config = SO101FollowerConfig(
+        id="my_follower",
+        port=FOLLOWER_PORT,
+        use_degrees=True,
+        cameras=cameras,
+    )
+    return SO101Follower(config)
+
+
+def _interpolate_move(bus, target_joints: np.ndarray, gripper: float, steps: int = 150, dt: float = 0.025):
+    pos_dict = bus.sync_read("Present_Position", num_retry=3)
+    current = np.array([pos_dict[name] for name in _IK_MOTOR_NAMES])
+    current_gripper = pos_dict.get("gripper", gripper)
+
+    joint_traj = np.linspace(current, target_joints, steps)
+    gripper_traj = np.linspace(current_gripper, gripper, steps)
+
+    for i in range(steps):
+        action_dict = {name: joint_traj[i][j] for j, name in enumerate(_IK_MOTOR_NAMES)}
+        action_dict["gripper"] = gripper_traj[i]
+        bus.sync_write("Goal_Position", action_dict, num_retry=3)
+        precise_sleep(dt)
+
+
+def reset_to_home(robot: SO101Follower, direct: bool = False) -> None:
+    bus = robot.bus
+    log_say("Resetting arm")
+
+    if not direct:
+        # Step 1: Snap to safe joints (all zeros) first
+        safe_joints = _clamp_degrees(np.zeros(5))
+        action_dict = {name: safe_joints[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
+        action_dict["gripper"] = HOME_GRIPPER
+        bus.sync_write("Goal_Position", action_dict, num_retry=3)
+        precise_sleep(1.5)
+
+    # Step 2: Interpolate to home position
+    home_joints = _clamp_degrees(HOME_JOINTS_DEG.copy())
+    _interpolate_move(bus, home_joints, HOME_GRIPPER)
+
+
+def run_episode(robot: SO101Follower, policy, device, dataset_features, events, episode_time_s, preprocessor=None, postprocessor=None, display=False):
+    """Run one inference episode: observe → predict → act at FPS."""
+    policy.reset()
+
+    action_keys = list(robot.action_features.keys())
+    start_time = time.perf_counter()
+    step = 0
+
+    logging.info(f"Running policy for up to {episode_time_s}s at {FPS} fps")
+
+    while True:
+        loop_start = time.perf_counter()
+
+        if events["exit_early"]:
+            events["exit_early"] = False
+            logging.info("Episode ended early (keyboard)")
+            break
+
+        elapsed = time.perf_counter() - start_time
+        if elapsed >= episode_time_s:
+            logging.info(f"Episode done ({elapsed:.1f}s, {step} steps)")
+            break
+
+        # Get observation from robot
+        obs_raw = robot.get_observation()
+
+        # Build observation dict matching dataset feature keys
+        obs_frame = build_dataset_frame(dataset_features, obs_raw, prefix="observation")
+
+        # Predict action
+        action_values = predict_action(
+            obs_frame,
+            policy,
+            device,
+            preprocessor,
+            postprocessor,
+            policy.config.use_amp,
+            task=TASK,
+            robot_type=robot.robot_type,
+        )
+
+        # Send action to robot (take first step if multi-step action)
+        if action_values.dim() > 1:
+            action_values = action_values[0]
+        action = {key: action_values[i].item() for i, key in enumerate(action_keys)}
+        robot.send_action(action)
+
+        if display:
+            log_rerun_data(obs_raw, action)
+
+        step += 1
+        precise_sleep(1.0 / FPS - (time.perf_counter() - loop_start))
+
+    return step
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run SmolVLA inference on SO-101")
+    parser.add_argument(
+        "--checkpoint", type=str, default=DEFAULT_CHECKPOINT,
+        help="Path to pretrained_model directory",
+    )
+    parser.add_argument("--num-rollouts", type=int, default=1, help="Number of episodes to run")
+    parser.add_argument("--episode-time", type=float, default=EPISODE_TIME_S, help="Episode duration (s)")
+    parser.add_argument("--display", action="store_true", help="Show rerun visualizer")
+    parser.add_argument(
+        "--record", nargs="?", const="auto", default=None,
+        help="Record video. Optional path, defaults to recordings/infer_{timestamp}.mp4",
+    )
+    parser.add_argument("--direct-reset", action="store_true", help="Interpolate straight to home (skip safe position)")
+    parser.add_argument("--no-overhead", action="store_true", help="Skip overhead camera (wrist cam only)")
+    args = parser.parse_args()
+
+    episode_time_s = args.episode_time
+
+    init_logging()
+
+    # Load policy
+    logging.info(f"Loading policy from {args.checkpoint}")
+    policy = SmolVLAPolicy.from_pretrained(args.checkpoint)
+    device = get_safe_torch_device(policy.config.device)
+    policy.eval()
+    logging.info(f"Policy loaded on {device} ({sum(p.numel() for p in policy.parameters()) / 1e6:.0f}M params)")
+
+    # Build pre/post processors for inference
+    from lerobot.policies.factory import make_pre_post_processors
+    preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=args.checkpoint)
+
+    # Build robot
+    robot = make_follower(no_overhead=args.no_overhead)
+    robot.connect()
+
+    # Log actual camera resolutions
+    for name, cam in robot.cameras.items():
+        logging.info(f"Camera '{name}': {cam.width}x{cam.height} @ {cam.fps}fps")
+
+    # Dataset features (needed for build_dataset_frame to map obs keys)
+    obs_features = hw_to_dataset_features(robot.observation_features, "observation", use_video=True)
+    action_features = hw_to_dataset_features(robot.action_features, "action", use_video=True)
+    dataset_features = {**obs_features, **action_features}
+
+    if args.display:
+        init_rerun(session_name="smolvla_inference")
+
+    # Keyboard listener
+    listener, events = init_keyboard_listener()
+
+    # Recording — background thread captures frames at fixed FPS, ffmpeg handles A/V sync
+    recorder = None
+    ffmpeg_proc = None
+    record_path = None
+    if args.record is not None:
+        if args.record == "auto":
+            os.makedirs("recordings", exist_ok=True)
+            record_path = f"recordings/infer_{datetime.now():%Y%m%d_%H%M%S}.mp4"
+        else:
+            record_path = args.record
+            os.makedirs(os.path.dirname(record_path) or ".", exist_ok=True)
+        if args.no_overhead:
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-f", "rawvideo",
+                "-pixel_format", "rgb24",
+                "-video_size", "640x480",
+                "-framerate", str(FPS),
+                "-i", "pipe:0",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p",
+                "-y", record_path,
+            ]
+        else:
+            ffmpeg_cmd = [
+                "ffmpeg",
+                # Video input: two 640x480 frames stacked vertically (RGB)
+                "-f", "rawvideo",
+                "-pixel_format", "rgb24",
+                "-video_size", "640x960",
+                "-framerate", str(FPS),
+                "-i", "pipe:0",
+                # Audio input
+                "-f", "pulse",
+                "-i", OVERHEAD_MIC,
+                # PiP compositing done by ffmpeg
+                "-filter_complex", FFMPEG_FILTER,
+                "-map", "[v]",
+                "-map", "1:a",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-shortest",
+                "-y", record_path,
+            ]
+        ffmpeg_proc = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        recorder = FrameRecorder(robot, ffmpeg_proc, FPS)
+        recorder.start()
+        logging.info(f"Recording to {record_path}")
+
+    try:
+        for ep in range(args.num_rollouts):
+            if events["stop_recording"]:
+                break
+
+            logging.info(f"--- Episode {ep + 1}/{args.num_rollouts} ---")
+            reset_to_home(robot, direct=args.direct_reset)
+            log_say(f"Starting episode {ep + 1}")
+            logging.info("Press right arrow to start (or it starts automatically in 3s)")
+            precise_sleep(3.0)
+
+            steps = run_episode(robot, policy, device, dataset_features, events, episode_time_s,
+                                preprocessor=preprocessor, postprocessor=postprocessor,
+                                display=args.display)
+            log_say("Episode ended")
+
+            if ep < args.num_rollouts - 1:
+                logging.info("Waiting 2s before next episode...")
+                precise_sleep(2.0)
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user")
+    finally:
+        try:
+            reset_to_home(robot, direct=args.direct_reset)
+        except Exception as e:
+            logging.warning(f"Reset failed (robot may have disconnected): {e}")
+        if recorder:
+            recorder.stop()
+            ffmpeg_proc.stdin.close()
+            ffmpeg_proc.terminate()
+            try:
+                ffmpeg_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                logging.warning("ffmpeg did not exit after SIGTERM, sending SIGKILL")
+                ffmpeg_proc.kill()
+                ffmpeg_proc.wait()
+            logging.info(f"Video saved to {record_path}")
+        robot.disconnect()
+        if listener is not None:
+            listener.stop()
+        logging.info("Done")
+
+
+if __name__ == "__main__":
+    main()

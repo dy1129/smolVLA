@@ -36,6 +36,22 @@ The task was divided into three sub-skills so that data collection, training, de
 - State-machine based task orchestration
 - Re-scan loop after each hazard removal
 
+## My Contributions
+
+- Integrated YOLO object detection, SmolVLA robot execution, and the SENTINEL dashboard into one workflow.
+- Built the dashboard server flow: scan the tray, detect hazards, open the box, remove each hazard, scan again, and close the box.
+- Connected top-camera and wrist-camera streams to the dashboard so the system state could be checked during the demo.
+- Configured the dual SO-101 arms, camera settings, task prompts, and dataset paths for battery/explosive removal.
+- Added reset logic for data recording so each episode could start from a stable robot pose.
+- Modified the SmolVLA training wrapper so the training code could use the camera names in our dataset.
+- Wrote helper scripts for dataset merging, robot diagnosis, and Isaac Sim trajectory replay.
+
+## Simple Results
+
+- YOLO detected 5 object classes with about 97% performance.
+- SmolVLA was connected to the real robot arm for task execution.
+- The dashboard displayed camera views, detection results, and robot progress in real time.
+
 ## System Components
 
 ### 1. Object Detection
@@ -50,14 +66,7 @@ The tray scene is scanned with a YOLO model trained to detect five object classe
 
 Battery and Explosive are treated as hazardous objects. The dashboard waits until the expected objects are detected stably before moving to the decision stage.
 
-YOLO training result after 50 epochs:
-
-| Metric | Value |
-|---|---:|
-| Precision | 0.98016 |
-| Recall | 0.96596 |
-| mAP50 | 0.96795 |
-| mAP50-95 | 0.90651 |
+YOLO was trained for 50 epochs and reached about 97% detection performance.
 
 ### 2. SmolVLA Manipulation
 
